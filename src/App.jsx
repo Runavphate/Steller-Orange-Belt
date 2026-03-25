@@ -1,26 +1,33 @@
 import { useState } from 'react';
-import { Shield, Wallet, Lock, Unlock, Send, Key } from 'lucide-react';
+import { Shield, Wallet, Play, Plus, Gift, CheckCircle } from 'lucide-react';
 import { isConnected, requestAccess, signTransaction } from '@stellar/freighter-api';
 import * as StellarSdk from '@stellar/stellar-sdk';
-import CryptoJS from 'crypto-js';
 import './index.css';
 
 const RPC_URL = 'https://soroban-testnet.stellar.org';
 const NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
 const server = new StellarSdk.rpc.Server(RPC_URL);
 
+// Using the contract ID from README, user can change if needed
+const CONTRACT_ID = 'CCP4Z5BZG3VCWWGNIDRPFJK4CMFHXJDPKAGOVO4RF62QN7L4R7ZFJATM';
+
 function App() {
   const [wallet, setWallet] = useState(null);
   const [isConnecting, setIsConnecting] = useState(false);
   
-  const [draft, setDraft] = useState('');
-  const [isEncrypting, setIsEncrypting] = useState(false);
-  const [encryptResult, setEncryptResult] = useState(null);
+  // Initialize
+  const [targetAmount, setTargetAmount] = useState('');
+  const [isInitializing, setIsInitializing] = useState(false);
+  
+  // Pledge
+  const [pledgeAmount, setPledgeAmount] = useState('');
+  const [isPledging, setIsPledging] = useState(false);
 
-  const [decryptInput, setDecryptInput] = useState('');
-  const [decryptKey, setDecryptKey] = useState('');
-  const [decryptResult, setDecryptResult] = useState('');
-  const [decryptError, setDecryptError] = useState('');
+  // Claim
+  const [isClaiming, setIsClaiming] = useState(false);
+
+  // UI feedback
+  const [message, setMessage] = useState('');
 
   const handleConnect = async () => {
     try {
@@ -41,75 +48,121 @@ function App() {
     }
   };
 
-  const handleEncryptAndSend = async () => {
-    if (!wallet || !draft.trim()) return;
+  const invokeContract = async (methodName, args) => {
+    if (!wallet) throw new Error("Wallet not connected");
+    const account = await server.getAccount(wallet);
+    
+    // Create the contract invocation operation
+    const op = StellarSdk.Operation.invokeHostFunction({
+      func: StellarSdk.xdr.HostFunction.hostFunctionTypeInvokeContract(
+        new StellarSdk.xdr.InvokeContractArgs({
+          contractAddress: new StellarSdk.Address(CONTRACT_ID).toScAddress(),
+          functionName: methodName,
+          args: args,
+        })
+      ),
+      auth: [], // In basic cases, auth might be handled automatically by Soroban via `require_auth`
+    });
+
+    let tx = new StellarSdk.TransactionBuilder(account, { 
+      fee: "10000", 
+      networkPassphrase: NETWORK_PASSPHRASE 
+    })
+    .addOperation(op)
+    .setTimeout(180)
+    .build();
+
+    // In soroban we need to prepare the transaction
+    const preparedTx = await server.prepareTransaction(tx);
+
+    const { signedTxXdr, error: signError } = await signTransaction(
+      preparedTx.toXDR(), 
+      { networkPassphrase: NETWORK_PASSPHRASE }
+    );
+    if (signError) throw new Error(signError);
+
+    const signedTx = StellarSdk.TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+    const sendResponse = await server.sendTransaction(signedTx);
+    
+    if (sendResponse.status === "ERROR") {
+      throw new Error(`TX failed: ${JSON.stringify(sendResponse.errorResult)}`);
+    }
+
+    // Wait for transaction to complete in Soroban
+    let txResponse = await server.getTransaction(sendResponse.hash);
+    let attempts = 0;
+    while (txResponse.status === "NOT_FOUND" && attempts < 10) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      txResponse = await server.getTransaction(sendResponse.hash);
+      attempts++;
+    }
+
+    if (txResponse.status !== "SUCCESS") {
+       throw new Error(`Transaction failed or timed out. Status: ${txResponse.status}`);
+    }
+
+    return sendResponse.hash;
+  };
+
+  const handleInitialize = async () => {
+    if (!wallet || !targetAmount) return;
     try {
-      setIsEncrypting(true);
-      setEncryptResult(null);
+      setIsInitializing(true);
+      setMessage('');
       
-      const generatedHashKey = CryptoJS.lib.WordArray.random(16).toString();
-      const encryptedPayload = CryptoJS.AES.encrypt(draft, generatedHashKey).toString();
+      const args = [
+        StellarSdk.nativeToScVal(wallet, { type: 'address' }),
+        StellarSdk.nativeToScVal(Number(targetAmount), { type: 'u64' })
+      ];
 
-      const account = await server.getAccount(wallet);
-      
-      const memoHash = CryptoJS.SHA256(encryptedPayload).toString(CryptoJS.enc.Hex).substring(0, 28);
-      
-      const op = StellarSdk.Operation.payment({
-         destination: wallet,
-         asset: StellarSdk.Asset.native(),
-         amount: "0.0000001"
-      });
-
-      let tx = new StellarSdk.TransactionBuilder(account, { fee: "10000", networkPassphrase: NETWORK_PASSPHRASE })
-      .addMemo(StellarSdk.Memo.text(memoHash))
-      .addOperation(op)
-      .setTimeout(180)
-      .build();
-
-      const { signedTxXdr, error: signError } = await signTransaction(tx.toXDR(), { networkPassphrase: NETWORK_PASSPHRASE });
-      if (signError) throw new Error(signError);
-
-      const signedTx = StellarSdk.TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
-      const sendResponse = await server.sendTransaction(signedTx);
-      
-      if (sendResponse.status === "ERROR") {
-        throw new Error(`TX failed: ${JSON.stringify(sendResponse.errorResult)}`);
-      }
-
-      setEncryptResult({
-        payload: encryptedPayload,
-        hashKey: generatedHashKey,
-        memoHash: memoHash
-      });
-      setDraft('');
-
+      const hash = await invokeContract("initialize", args);
+      setMessage(`Successfully initialized campaign! TX: ${hash.substring(0,8)}...`);
+      setTargetAmount('');
     } catch (err) {
       console.error(err);
-      alert(`Encryption failed: ${err?.message || 'Check your testnet connection.'}`);
+      setMessage(`Initialization failed: ${err?.message}`);
     } finally {
-      setIsEncrypting(false);
+      setIsInitializing(false);
     }
   };
 
-  const handleDecrypt = () => {
-    setDecryptResult('');
-    setDecryptError('');
-    if (!decryptInput.trim() || !decryptKey.trim()) {
-      setDecryptError("Please provide both the Encrypted Ciphertext and the correct HashKey.");
-      return;
-    }
+  const handlePledge = async () => {
+     if (!wallet || !pledgeAmount) return;
+     try {
+       setIsPledging(true);
+       setMessage('');
+       
+       const args = [
+         StellarSdk.nativeToScVal(wallet, { type: 'address' }),
+         StellarSdk.nativeToScVal(Number(pledgeAmount), { type: 'u64' })
+       ];
+ 
+       const hash = await invokeContract("pledge", args);
+       setMessage(`Successfully pledged ${pledgeAmount} to campaign! TX: ${hash.substring(0,8)}...`);
+       setPledgeAmount('');
+     } catch (err) {
+       console.error(err);
+       setMessage(`Pledge failed: ${err?.message}`);
+     } finally {
+       setIsPledging(false);
+     }
+  };
 
+  const handleClaim = async () => {
+    if (!wallet) return;
     try {
-      const bytes = CryptoJS.AES.decrypt(decryptInput, decryptKey);
-      const originalText = bytes.toString(CryptoJS.enc.Utf8);
+      setIsClaiming(true);
+      setMessage('');
       
-      if (!originalText) {
-         throw new Error("Invalid key or corrupted ciphertext.");
-      }
-      
-      setDecryptResult(originalText);
+      const args = []; // claim takes only env
+
+      const hash = await invokeContract("claim", args);
+      setMessage(`Successfully claimed funds! TX: ${hash.substring(0,8)}...`);
     } catch (err) {
-      setDecryptError("Decryption failed. Ensure your HashKey and Ciphertext are exactly correct.");
+      console.error(err);
+      setMessage(`Claim failed: ${err?.message}`);
+    } finally {
+      setIsClaiming(false);
     }
   };
 
@@ -119,7 +172,7 @@ function App() {
     <div className="layout">
       <header className="header glass-panel">
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <h1 className="gradient-text" style={{ margin: 0 }}>SafeBoxMessage</h1>
+          <h1 className="gradient-text" style={{ margin: 0 }}>DeFi Crowdfund</h1>
         </div>
         
         <button onClick={handleConnect} disabled={isConnecting || !!wallet}>
@@ -134,107 +187,94 @@ function App() {
       </header>
 
       <div className="glass-panel" style={{ paddingBottom: '0.5rem' }}>
-        <h2 style={{ fontSize: '2rem', marginTop: 0 }}>End-to-End Encrypted Messenger</h2>
+        <h2 style={{ fontSize: '2rem', marginTop: 0 }}>Next-Gen Crowdfunding</h2>
         <p className="text-dim" style={{ marginBottom: '2rem' }}>
-          Encrypt your message on the left to get a unique HashKey (AES). To decrypt, you must provide the exact HashKey (AES) and Ciphertext on the right.
+          Create your campaign, pledge to visionary projects, and transparently claim funds upon reaching goals using Soroban smart contracts.
         </p>
       </div>
+
+      {message && (
+        <div className="glass-panel" style={{ background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.2)' }}>
+           <p style={{ margin: 0, color: '#10b981', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+             <CheckCircle size={18} /> {message}
+           </p>
+        </div>
+      )}
 
       <div className="grid-2">
         <section className="glass-panel">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--primary)', marginTop: 0 }}>
-            <Lock size={20} /> Message Secret
+            <Play size={20} /> Creator Actions
           </h3>
-          <textarea 
-            placeholder="Type your sensitive message here..."
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-          />
-          <button 
-            style={{ width: '100%', padding: '1rem' }} 
-            onClick={handleEncryptAndSend} 
-            disabled={isEncrypting || !draft.trim() || !wallet}
-          >
-            {isEncrypting ? (
-              <><div className="spinner" /> Encrypting...</>
-            ) : (
-              <><Send size={20}/> Encrypt & Broadcast</>
-            )}
-          </button>
-          {!wallet && <p style={{ fontSize: '0.85rem', color: '#fbbf24', textAlign: 'center', marginTop: '1rem' }}>Connect wallet</p>}
+          
+          <div style={{ marginBottom: '2rem' }}>
+            <h4 style={{ color: '#94a3b8', marginBottom: '0.5rem', marginTop: 0 }}>Initialize Campaign</h4>
+            <input 
+              type="number"
+              placeholder="Target Amount (e.g. 1000)"
+              value={targetAmount}
+              onChange={(e) => setTargetAmount(e.target.value)}
+              style={{ width: '100%', padding: '0.75rem', marginBottom: '1rem', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: 'white' }}
+            />
+            <button 
+              style={{ width: '100%', padding: '1rem' }} 
+              onClick={handleInitialize} 
+              disabled={isInitializing || !targetAmount.trim() || !wallet}
+            >
+              {isInitializing ? (
+                <><div className="spinner" /> Initializing...</>
+              ) : (
+                <><Play size={20}/> Initialize Campaign</>
+              )}
+            </button>
+          </div>
 
-          {encryptResult && (
-            <div style={{ marginTop: '1.5rem', padding: '1rem', background: 'rgba(59,130,246,0.1)', borderRadius: '8px', border: '1px solid rgba(59,130,246,0.2)' }}>
-              <h4 style={{ margin: '0 0 1rem 0', color: '#60a5fa' }}>Success! Keep this safe:</h4>
-              
-              <div style={{ marginBottom: '1rem' }}>
-                <strong style={{ fontSize: '0.85rem', color: '#94a3b8' }}>Stellar Memo (SHA-256):</strong>
-                <div style={{ fontSize: '0.8rem', color: '#fbbf24', wordBreak: 'break-all', marginTop: '0.25rem' }}>
-                  {encryptResult.memoHash}
-                </div>
-              </div>
-
-              <div style={{ marginBottom: '1rem' }}>
-                <strong style={{ fontSize: '0.85rem', color: '#94a3b8' }}>Encrypted Payload (Ciphertext):</strong>
-                <div style={{ fontSize: '0.8rem', color: '#f8fafc', fontWeight: 'bold', wordBreak: 'break-all', background: 'rgba(0,0,0,0.3)', padding: '0.5rem', borderRadius: '4px', marginTop: '0.25rem', userSelect: 'all' }}>
-                  {encryptResult.payload}
-                </div>
-              </div>
-
-              <div>
-                <strong style={{ fontSize: '0.85rem', color: '#94a3b8' }}>Your Secret HashKey (AES):</strong>
-                <div style={{ fontSize: '0.9rem', color: '#ef4444', fontWeight: 'bold', wordBreak: 'break-all', background: 'rgba(0,0,0,0.3)', padding: '0.5rem', borderRadius: '4px', marginTop: '0.25rem', userSelect: 'all' }}>
-                  {encryptResult.hashKey}
-                </div>
-              </div>
-            </div>
-          )}
+          <div>
+             <h4 style={{ color: '#94a3b8', marginBottom: '0.5rem', marginTop: 0 }}>Claim Funds</h4>
+             <p style={{ fontSize: '0.85rem', color: '#64748b', marginBottom: '1rem' }}>Only the creator can claim funds once the target is reached.</p>
+             <button 
+              style={{ width: '100%', padding: '1rem', background: 'transparent', border: '1px solid var(--primary)', color: 'white' }} 
+              onClick={handleClaim} 
+              disabled={isClaiming || !wallet}
+            >
+              {isClaiming ? (
+                <><div className="spinner" /> Claiming...</>
+              ) : (
+                <><Gift size={20}/> Claim Funds</>
+              )}
+            </button>
+          </div>
         </section>
 
         <section className="glass-panel">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--secondary)', margin: 0 }}>
-              <Unlock size={20} /> Decrypt Message
-            </h3>
-          </div>
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--secondary)', margin: 0, marginBottom: '1rem' }}>
+            <Plus size={20} /> Backer Actions
+          </h3>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-            <textarea 
-              placeholder="Paste the Encrypted Payload (Ciphertext) here..."
-              value={decryptInput}
-              onChange={(e) => setDecryptInput(e.target.value)}
-              style={{ minHeight: '80px' }}
-            />
+            <p style={{ fontSize: '0.9rem', color: '#94a3b8', margin: 0 }}>
+               Support this project by pledging tokens. Your funds are secured by the smart contract until the goal is met.
+            </p>
             
-            <div style={{ position: 'relative' }}>
-              <Key size={18} style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
-              <input 
-                type="text" 
-                placeholder="Enter HashKey (AES)..." 
-                value={decryptKey}
-                onChange={(e) => setDecryptKey(e.target.value)}
-                style={{ width: '100%', padding: '0.75rem 1rem 0.75rem 2.5rem', background: 'rgba(255, 255, 255, 0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: 'white', outline: 'none' }}
-              />
-            </div>
+            <input 
+              type="number" 
+              placeholder="Pledge Amount" 
+              value={pledgeAmount}
+              onChange={(e) => setPledgeAmount(e.target.value)}
+              style={{ width: '100%', padding: '0.75rem', background: 'rgba(255, 255, 255, 0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', color: 'white', outline: 'none' }}
+            />
 
             <button 
-              style={{ width: '100%', padding: '1rem', background: 'transparent', border: '1px solid var(--secondary)', color: 'white' }} 
-              onClick={handleDecrypt} 
-              disabled={!decryptInput.trim() || !decryptKey.trim()}
+              style={{ width: '100%', padding: '1rem', background: 'var(--secondary)', color: 'white' }} 
+              onClick={handlePledge} 
+              disabled={isPledging || !pledgeAmount.trim() || !wallet}
             >
-              <Unlock size={18}/> Verify & Decrypt
+              {isPledging ? (
+                <><div className="spinner" /> Pledging...</>
+              ) : (
+                <><Plus size={18}/> Pledge to Campaign</>
+              )}
             </button>
-
-            {decryptError && (
-              <p style={{ color: '#ef4444', fontSize: '0.9rem', textAlign: 'center' }}>{decryptError}</p>
-            )}
-
-            {decryptResult && (
-              <div style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.2)', borderRadius: '8px' }}>
-                <strong style={{ fontSize: '0.85rem', color: '#10b981' }}>Decrypted Original Message:</strong>
-                <p style={{ margin: '0.5rem 0 0 0', color: 'white', whiteSpace: 'pre-wrap' }}>{decryptResult}</p>
-              </div>
-            )}
           </div>
         </section>
       </div>

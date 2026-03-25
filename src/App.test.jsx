@@ -1,55 +1,60 @@
-import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import App from './App';
+import * as freighterApi from '@stellar/freighter-api';
 
-vi.mock('@stellar/stellar-sdk', () => ({
-  rpc: { Server: vi.fn() },
-  Networks: { TESTNET: 'testnet' },
-  Contract: vi.fn(),
-  Address: vi.fn(),
-  ScInt: vi.fn(),
-  Memo: { text: vi.fn() },
-  Asset: { native: vi.fn() },
-  Operation: { payment: vi.fn() },
-  TransactionBuilder: vi.fn()
-}));
-
+// Mock the freighter-api
 vi.mock('@stellar/freighter-api', () => ({
-  isConnected: vi.fn().mockResolvedValue(true),
-  requestAccess: vi.fn().mockResolvedValue({ address: 'GTESTWALLET123' }),
-  signTransaction: vi.fn()
+  isConnected: vi.fn(),
+  requestAccess: vi.fn(),
+  signTransaction: vi.fn(),
 }));
 
-describe('Mini-dApp Messenger', () => {
+describe('Crowdfund dApp', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('renders the header and main layout', () => {
     render(<App />);
-    expect(screen.getByText(/SafeBoxMessage/i)).toBeInTheDocument();
+    expect(screen.getByText('DeFi Crowdfund')).toBeInTheDocument();
+    expect(screen.getByText('Next-Gen Crowdfunding')).toBeInTheDocument();
   });
 
   it('initially displays Connect Freighter button', () => {
     render(<App />);
-    expect(screen.getByText(/Connect Freighter/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Connect Freighter/i })).toBeInTheDocument();
   });
 
-  it('shows loading state when connecting wallet', async () => {
+  it('shows loading state when connecting', async () => {
+    freighterApi.isConnected.mockResolvedValue(true);
+    let resolveAccess;
+    freighterApi.requestAccess.mockReturnValue(new Promise(resolve => {
+        resolveAccess = resolve;
+    }));
+
     render(<App />);
-    const connectBtn = screen.getByText(/Connect Freighter/i);
-    fireEvent.click(connectBtn);
+    const connectBtn = screen.getByRole('button', { name: /Connect Freighter/i });
     
+    fireEvent.click(connectBtn);
+    expect(screen.getByRole('button', { name: /Connecting\.\.\./i })).toBeInTheDocument();
+    
+    resolveAccess({ address: 'GBXC12345678TEST' });
     await waitFor(() => {
-      expect(screen.getByText(/Connecting.../i)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /GBXC1\.\.\.TEST/i })).toBeInTheDocument();
     });
   });
 
-  it('displays the Message Secret and Decrypt Message panels', () => {
+  it('displays Creator and Backer panels', () => {
     render(<App />);
-    expect(screen.getByText(/Message Secret/i)).toBeInTheDocument();
-    expect(screen.getByText(/Decrypt Message/i)).toBeInTheDocument();
+    expect(screen.getByText('Creator Actions')).toBeInTheDocument();
+    expect(screen.getByText('Backer Actions')).toBeInTheDocument();
   });
 
-  it('initially disables the Verify & Decrypt button', () => {
+  it('initially disables the action buttons without wallet connected', () => {
     render(<App />);
-    const decryptBtn = screen.getByRole('button', { name: /Verify & Decrypt/i });
-    expect(decryptBtn).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Initialize Campaign/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Claim Funds/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Pledge to Campaign/i })).toBeDisabled();
   });
 });
